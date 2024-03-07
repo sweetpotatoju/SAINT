@@ -4,42 +4,40 @@ import pandas as pd
 from sklearn.model_selection import KFold
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 import torch.optim as optim
+from sklearn.preprocessing import MinMaxScaler
+from imblearn.over_sampling import SMOTE
+from sklearn.metrics import confusion_matrix
+import argparse
 
 from augmentations import embed_data_mask
 from pretraining import SAINT_pretrain
 from pretrainmodel import SAINT
-import argparse
-from torch.utils.data import DataLoader,TensorDataset
 import wandb
 
 
-from sklearn.preprocessing import MinMaxScaler
-from imblearn.over_sampling import SMOTE
-from sklearn.metrics import confusion_matrix, accuracy_score, mean_squared_error
-
-pd_list = []
-pf_list = []
-bal_list = []
-fir_list = []
-
-
-def classifier_eval(y_test, y_pred):
+def calculate_metrics(y_test, y_pred):
     cm = confusion_matrix(y_test, y_pred)
-    print('혼동행렬 : ', cm)
     PD = cm[1, 1] / (cm[1, 1] + cm[1, 0])
-    print('PD : ', PD)
     PF = cm[0, 1] / (cm[0, 0] + cm[0, 1])
-    print('PF : ', PF)
-    balance = 1 - (((0 - PF) * (0 - PF) + (1 - PD) * (1 - PD)) / 2)
-    print('balance : ', balance)
+    balance = 1 - np.sqrt((1 - PD)**2 + PF**2) / np.sqrt(2)
     FI = (cm[1, 1] + cm[0, 1]) / (cm[0, 0] + cm[0, 1] + cm[1, 0] + cm[1, 1])
     FIR = (PD - FI) / PD
-    print('FIR : ', FIR)
-
     return PD, PF, balance, FIR
 
+# Function to evaluate classifier
+def classifier_eval(y_test, y_pred):
+    cm = confusion_matrix(y_test, y_pred)
+    PD, PF, balance, FIR = calculate_metrics(y_test, y_pred)
+    pd_list.append(PD)
+    pf_list.append(PF)
+    bal_list.append(balance)
+    fir_list.append(FIR)
+    print('Confusion Matrix:', cm)
+    print('Length of y_test:', len(y_test))
+    print('Length of y_pred:', len(y_pred))
+    print(f'PD: {PD}, PF: {PF}, Balance: {balance}, FIR: {FIR}')
 
 
 
@@ -60,7 +58,7 @@ def get_args():
 
     parser.add_argument('--lr', default=0.0001, type=float)
     parser.add_argument('--epochs', default=100, type=int)
-    parser.add_argument('--batchsize', default=64, type=int)
+    parser.add_argument('--batchsize', default=32, type=int)
     parser.add_argument('--savemodelroot', default='./bestmodels', type=str)
     parser.add_argument('--run_name', default='testrun', type=str)
     parser.add_argument('--set_seed', default=1, type=int)
@@ -94,67 +92,78 @@ def get_args():
 
 
 
-
-# CSV 파일 경로를 지정
+# CSV file path
 csv_file_path = "EQ.csv"
 
-# CSV 파일을 데이터프레임으로 읽어오기
+# Read CSV file into a dataframe
 df = pd.read_csv(csv_file_path)
-# print(df)
 
-# 데이터프레임에서 특징(X)과 목표 변수(y) 추출
+# Extract features (X) and target variables (y) from the dataframe
 X = df.drop(columns=['class'])
-y = df['class']  # 'target' 열을 목표 변수로 사용'
+y = df['class']
+print(X)
 
+# Split the data into train, validation, and test sets
 X_temp, X_test, y_temp, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
 X_train, X_valid, y_train, y_valid = train_test_split(X_temp, y_temp, test_size=0.2, random_state=42)
 
-# K-겹 교차 검증을 설정합니다
-k = 5 # K 값 (원하는 폴드 수) 설정
+# K-Fold Cross Validation
+k = 5  # Number of folds
 kf = KFold(n_splits=k, shuffle=True, random_state=42)
 
-scaler = MinMaxScaler()
-X_test_Nomalized = scaler.fit_transform(X_test)
+# Initialize lists to store metrics
+pd_list = []
+pf_list = []
+bal_list = []
+fir_list = []
 
+
+# Min-Max Scaling
+scaler = MinMaxScaler()
+X_test_normalized = scaler.fit_transform(X_test)
+
+# Get arguments
 opt = get_args()
-# K-겹 교차 검증 수행
+
+# K-Fold Cross Validation
 for train_index, val_index in kf.split(X_train):
     X_fold_train, X_fold_val = X_train.iloc[train_index], X_train.iloc[val_index]
     y_fold_train, y_fold_val = y_train.iloc[train_index], y_train.iloc[val_index]
 
-    # 전처리
-    # Min-Max 정규화 수행(o)
+    # Preprocessing
     X_fold_train_normalized = scaler.fit_transform(X_fold_train)
     X_fold_val_normalized = scaler.transform(X_fold_val)
 
-    # SMOTE를 사용하여 학습 데이터 오버샘플링
+    # SMOTE for oversampling
     smote = SMOTE(random_state=42)
     X_fold_train_resampled, y_fold_train_resampled = smote.fit_resample(X_fold_train_normalized, y_fold_train)
 
+    # Convert to PyTorch tensors
     X_train_tensor = torch.tensor(X_fold_train_resampled)
     y_train_tensor = torch.tensor(y_fold_train_resampled)
 
+    # Create DataLoader
     train_ds = TensorDataset(X_train_tensor, y_train_tensor)
-    trainloader = DataLoader(train_ds, batch_size=opt.batchsize, shuffle=True, num_workers=0, pin_memory=False)
+    trainloader = DataLoader(train_ds, batch_size=opt.batchsize, shuffle=True)
     vision_dset = opt.vision_dset
 
-    X_test_tensor = torch.tensor(X_test_Nomalized)
-    y_test_array = y_test.to_numpy()  # 시리즈를 넘파이 배열로 변환
+    # Convert test data to PyTorch tensors
+    X_test_tensor = torch.tensor(X_test_normalized)
+    y_test_array = y_test.to_numpy()
     y_test_tensor = torch.tensor(y_test_array)
 
     test_ds = TensorDataset(X_test_tensor, y_test_tensor)
     testloader = DataLoader(test_ds, batch_size=opt.batchsize, shuffle=True, num_workers=0, pin_memory=False)
 
-
+    # Define model
     cat_dims = []
     con_idxs = 61
     cat_idxs = 10
 
     model = SAINT(
-        categories = tuple(cat_dims),
+        categories=tuple(cat_dims),
         num_continuous=con_idxs,
-        dim=opt.embedding_size,
+        dim=61,
         dim_out=1,
         depth=opt.transformer_depth,
         heads=opt.attention_heads,
@@ -164,75 +173,82 @@ for train_index, val_index in kf.split(X_train):
         cont_embeddings=opt.cont_embeddings,
         attentiontype=opt.attentiontype,
         final_mlp_style=opt.final_mlp_style,
-        y_dim= 2
+        y_dim=2
     )
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"Device is {device}.")
 
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}.")
     model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=opt.lr)
 
-    print('Training begins now.')
+    print('학습을 시작합니다.')
     for epoch in range(opt.epochs):
         model.train()
         running_loss = 0.0
         for i, data in enumerate(trainloader, 0):
             optimizer.zero_grad()
-            x_input, y_label = data  # 수정: 데이터 튜플에서 입력과 레이블 추출
+            x_cont = data[0].to(device).float()
 
-            x_cont = x_input.to(device)  # 모든 입력 데이터를 연속형 변수로 간주하여 하나의 텐서로 처리합니다.
-            x_cont = x_cont.float()  # 데이터 유형을 float32로 변환
+            y_gts = data[1].to(device)
 
-            cat_mask, con_mask = None, None  # cat_mask와 con_mask가 없는 경우
-
+            # 연속형 데이터를 임베딩으로 변환합니다.
             x_cont_enc = embed_data_mask(x_cont, model, vision_dset)
             reps = model.transformer(x_cont_enc)
-            # select only the representations corresponding to CLS token and apply mlp on it in the next step to get the predictions.
             y_reps = reps[:, 0, :]
 
+            # 모델에 연속형 데이터를 전달하여 출력을 얻습니다.
             y_outs = model.mlpfory(y_reps)
 
+            import torch.nn.functional as F
+            # 소프트맥스 함수를 적용하여 확률로 변환합니다.
+            y_probs = F.softmax(y_outs, dim=1)
+
+
             criterion = nn.CrossEntropyLoss().to(device)
-            loss = criterion(y_outs, y_label.squeeze())
+
+            # 크로스 엔트로피 손실을 계산합니다.
+            loss = criterion(y_probs, y_gts.squeeze())
+
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
 
-            print(({'epoch': epoch ,'train_epoch_loss': running_loss,
-            'loss': loss.item()}))
+        if epoch % 5 == 0:
+            print(f"Epoch [{epoch}/{opt.epochs}], Loss: {running_loss}")
 
-    m = nn.Softmax(dim=1)
-    # 모델을 평가 모드로 설정합니다.
+    # 모델을 평가 모드로 변경
     model.eval()
 
-    y_pred = torch.empty(0).to(device)  # y_pred 초기화
-    prob = torch.empty(0).to(device)
 
-    # torch.no_grad() 블록 내에서 평가를 수행합니다.
+
+    # 입력 데이터를 모델에 전달하여 예측값을 얻음
     with torch.no_grad():
-        for data in testloader:  # 테스트 데이터를 사용하여 반복합니다.
-            x_input, y_label = data
+            for i, data in enumerate(testloader, 0):
+                optimizer.zero_grad()
+                x_cont = data[0].to(device).float()
 
-            # 입력 데이터를 디바이스로 이동하고 float32로 변환합니다.
-            x_cont = x_input.to(device)
-            x_cont = x_cont.float()
+                # 연속형 데이터를 임베딩으로 변환합니다.
+                x_cont_enc = embed_data_mask(x_cont, model, vision_dset)
+                reps = model.transformer(x_cont_enc)
+                y_reps = reps[:, 0, :]
 
-            # 데이터를 모델에 전달하여 예측을 생성합니다.
-            x_cont_enc = embed_data_mask(x_cont, model, vision_dset)
-            reps = model.transformer(x_cont_enc)
-            y_reps = reps[:, 0, :]
-            y_outs = model.mlpfory(y_reps)
+                y_outs = model.mlpfory(y_reps)
 
-            prob = torch.cat([prob,m(y_outs)[:,-1].float()],dim=0)
-            print(prob)
-
+                # 소프트맥스 함수를 적용하여 확률로 변환합니다.
+                y_probs = F.softmax(y_outs, dim=1)
+                print(y_probs)
 
 
 
 
-print('avg_PD: {}'.format((sum(pd_list) / len(pd_list))))
-print('avg_PF: {}'.format((sum(pf_list) / len(pf_list))))
-print('avg_balance: {}'.format((sum(bal_list) / len(bal_list))))
-print('avg_FIR: {}'.format((sum(fir_list) / len(fir_list))))
-
-
+# # Calculating average metrics
+# avg_PD = sum(pd_list) / len(pd_list) if len(pd_list) > 0 else 'No values in pd_list'
+# avg_PF = sum(pf_list) / len(pf_list) if len(pf_list) > 0 else 'No values in pf_list'
+# avg_balance = sum(bal_list) / len(bal_list) if len(bal_list) > 0 else 'No values in bal_list'
+# avg_FIR = sum(fir_list) / len(fir_list) if len(fir_list) > 0 else 'No values in fir_list'
+#
+# # Print or use the average metrics as needed
+# print('Average PD:', avg_PD)
+# print('Average PF:', avg_PF)
+# print('Average balance:', avg_balance)
+# print('Average FIR:', avg_FIR)

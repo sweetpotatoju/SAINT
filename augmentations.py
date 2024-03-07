@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 
+
 def embed_data_mask(x_cont, model, vision_dset=False):
     device = x_cont.device
 
@@ -23,7 +24,6 @@ def embed_data_mask(x_cont, model, vision_dset=False):
     con_mask_temp = con_mask_temp.long()
     con_mask_temp = model.mask_embeds_cont(con_mask_temp)
 
-
     x_cont_enc[con_mask == 0] = con_mask_temp[con_mask == 0]
 
     if vision_dset:
@@ -34,6 +34,7 @@ def embed_data_mask(x_cont, model, vision_dset=False):
         x_cont_enc += pos_enc
 
     return x_cont_enc
+
 
 def mixup_data(x1, x2, lam=1.0, y=None, use_cuda=True):
     '''Returns mixed inputs, pairs of targets'''
